@@ -2,12 +2,22 @@ use std::fmt;
 
 #[derive(Debug)]
 pub enum NotaDbError {
-    // e.g. key not found, encoding issues, etc.
+    Io(std::io::Error),
+    Corruption(String),
 }
 
 impl fmt::Display for NotaDbError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        todo!()
+        match self {
+            NotaDbError::Io(e) => write!(f, "io error: {}", e),
+            NotaDbError::Corruption(msg) => write!(f, "corruption: {}", msg),
+        }
+    }
+}
+
+impl From<std::io::Error> for NotaDbError {
+    fn from(e: std::io::Error) -> Self {
+        NotaDbError::Io(e)
     }
 }
 
