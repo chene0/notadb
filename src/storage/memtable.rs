@@ -39,11 +39,13 @@ impl MemTable {
     }
 
     /// Retrieve the value for a key, if it exists.
+    /// Returns Some(None) if the key maps to a tombstone
     ///
-    /// Returns `None` if the key is not present (including if it was deleted).
-    pub fn get(&self, key: &[u8]) -> Option<&[u8]> {
+    /// Returns `None` if the key is not present.
+    pub fn get(&self, key: &[u8]) -> Option<Option<&[u8]>> {
         match self.dict.get(key) {
-            Some(ValueEntry::Value(bytes)) => Some(bytes),
+            Some(ValueEntry::Value(bytes)) => Some(Some(bytes)),
+            Some(ValueEntry::Tombstone) => Some(None),
             _ => None,
         }
     }
@@ -63,10 +65,10 @@ impl MemTable {
     /// Returns an iterator over key-value pairs in sorted key order.
     ///
     /// This is used when flushing the memtable to an SSTable.
-    pub fn iter(&self) -> impl Iterator<Item = (&[u8], &[u8])> {
-        self.dict.iter().filter_map(|(key, val)| match val {
-            ValueEntry::Value(bytes) => Some((key.as_slice(), bytes.as_slice())),
-            ValueEntry::Tombstone => None,
+    pub fn iter(&self) -> impl Iterator<Item = (&[u8], Option<&[u8]>)> {
+        self.dict.iter().map(|(key, val)| match val {
+            ValueEntry::Value(bytes) => (key.as_slice(), Some(bytes.as_slice())),
+            ValueEntry::Tombstone => (key.as_slice(), None),
         })
     }
 
@@ -92,7 +94,7 @@ mod tests {
     fn set_and_get() {
         let mut mt = MemTable::new();
         mt.set(b"foo", b"bar").unwrap();
-        assert_eq!(mt.get(b"foo"), Some(b"bar".as_slice()));
+        assert_eq!(mt.get(b"foo"), Some(Some(b"bar".as_slice())));
     }
 
     #[test]
@@ -106,22 +108,22 @@ mod tests {
         let mut mt = MemTable::new();
         mt.set(b"foo", b"first").unwrap();
         mt.set(b"foo", b"second").unwrap();
-        assert_eq!(mt.get(b"foo"), Some(b"second".as_slice()));
+        assert_eq!(mt.get(b"foo"), Some(Some(b"second".as_slice())));
     }
 
     #[test]
-    fn delete_makes_key_invisible() {
+    fn delete_returns_tombstone() {
         let mut mt = MemTable::new();
         mt.set(b"foo", b"bar").unwrap();
         mt.delete(b"foo").unwrap();
-        assert_eq!(mt.get(b"foo"), None);
+        assert_eq!(mt.get(b"foo"), Some(None));
     }
 
     #[test]
     fn delete_nonexistent_key_is_ok() {
         let mut mt = MemTable::new();
         assert!(mt.delete(b"ghost").is_ok());
-        assert_eq!(mt.get(b"ghost"), None);
+        assert_eq!(mt.get(b"ghost"), Some(None));
     }
 
     #[test]
@@ -130,7 +132,7 @@ mod tests {
         mt.set(b"foo", b"bar").unwrap();
         mt.delete(b"foo").unwrap();
         mt.set(b"foo", b"baz").unwrap();
-        assert_eq!(mt.get(b"foo"), Some(b"baz".as_slice()));
+        assert_eq!(mt.get(b"foo"), Some(Some(b"baz".as_slice())));
     }
 
     #[test]
@@ -141,19 +143,23 @@ mod tests {
         mt.set(b"b", b"2").unwrap();
 
         let keys: Vec<&[u8]> = mt.iter().map(|(k, _)| k).collect();
-        assert_eq!(keys, vec![b"a".as_slice(), b"b".as_slice(), b"c".as_slice()]);
+        assert_eq!(
+            keys,
+            vec![b"a".as_slice(), b"b".as_slice(), b"c".as_slice()]
+        );
     }
 
     #[test]
-    fn iter_skips_tombstones() {
+    fn iter_includes_tombstones() {
         let mut mt = MemTable::new();
         mt.set(b"a", b"1").unwrap();
         mt.set(b"b", b"2").unwrap();
         mt.delete(b"a").unwrap();
 
-        let pairs: Vec<(&[u8], &[u8])> = mt.iter().collect();
-        assert_eq!(pairs.len(), 1);
-        assert_eq!(pairs[0], (b"b".as_slice(), b"2".as_slice()));
+        let pairs: Vec<(&[u8], Option<&[u8]>)> = mt.iter().collect();
+        assert_eq!(pairs.len(), 2);
+        assert_eq!(pairs[0], (b"a".as_slice(), None));
+        assert_eq!(pairs[1], (b"b".as_slice(), Some(b"2".as_slice())));
     }
 
     #[test]
