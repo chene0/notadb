@@ -15,7 +15,7 @@ pub struct LsmEngine {
     memtable: MemTable,
     wal: Wal,
     /// SSTables ordered oldest → newest; reads scan in reverse.
-    sstables: Vec<SSTable>,
+    sstables: Vec<(PathBuf, SSTable)>,
     next_sstable_id: u64,
 }
 
@@ -42,9 +42,12 @@ impl LsmEngine {
 
         sstable_paths.sort();
 
-        let mut sstables = Vec::<SSTable>::new();
-        for sstable_path in &sstable_paths {
-            sstables.push(SSTable::open(sstable_path)?);
+        let next_sstable_id = sstable_paths.len() as u64;
+
+        let mut sstables = Vec::<(PathBuf, SSTable)>::new();
+        for sstable_path in sstable_paths {
+            let sstable = SSTable::open(&sstable_path)?;
+            sstables.push((sstable_path, sstable));
         }
 
         let wal_path = Self::wal_path(dir);
@@ -64,7 +67,7 @@ impl LsmEngine {
             memtable,
             wal,
             sstables,
-            next_sstable_id: sstable_paths.len() as u64,
+            next_sstable_id,
         })
     }
 
@@ -108,7 +111,7 @@ impl LsmEngine {
 
         let sstables_inc = self.sstables.iter_mut().rev();
 
-        for sstable in sstables_inc {
+        for (_, sstable) in sstables_inc {
             match sstable.get(key)? {
                 Some(Some(bytes)) => return Ok(Some(bytes.to_vec())),
                 Some(None) => return Ok(None),
@@ -146,7 +149,8 @@ impl LsmEngine {
         std::fs::remove_file(&wal_path)?;
         self.wal = Wal::open(&wal_path)?;
 
-        self.sstables.push(SSTable::open(&sstable_path)?);
+        let sstable = SSTable::open(&sstable_path)?;
+        self.sstables.push((sstable_path, sstable));
         self.memtable = MemTable::new();
         self.next_sstable_id += 1;
 
