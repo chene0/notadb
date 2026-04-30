@@ -1,8 +1,10 @@
+use std::collections::BTreeMap;
+use std::fs::remove_file;
 use std::path::{Path, PathBuf};
 
 use crate::error::Result;
 use crate::storage::memtable::MemTable;
-use crate::storage::sstable::{SSTable, SSTableWriter};
+use crate::storage::sstable::{SSTable, SSTableEntry, SSTableWriter};
 use crate::storage::wal::{Wal, WalEntry};
 
 /// An LSM-tree storage engine.
@@ -42,7 +44,17 @@ impl LsmEngine {
 
         sstable_paths.sort();
 
-        let next_sstable_id = sstable_paths.len() as u64;
+        let next_sstable_id = sstable_paths
+            .last()
+            .and_then(|p| {
+                p.file_stem()?
+                    .to_str()?
+                    .strip_prefix("sstable_")?
+                    .parse::<u64>()
+                    .ok()
+            })
+            .map(|id| id + 1)
+            .unwrap_or(0);
 
         let mut sstables = Vec::<(PathBuf, SSTable)>::new();
         for sstable_path in sstable_paths {
@@ -157,6 +169,61 @@ impl LsmEngine {
         Ok(())
     }
 
+    pub fn compact(&mut self) -> Result<()> {
+        if self.sstables.len() < 2 {
+            return Ok(());
+        }
+
+        let mut merged = BTreeMap::<Vec<u8>, Option<Vec<u8>>>::new();
+        let mut old_paths = Vec::<PathBuf>::new();
+
+        let sstables_iter = self.sstables.iter_mut();
+
+        for (old_path, sstable) in sstables_iter {
+            let sstable_entries = sstable.iter()?;
+            for sstable_entry in sstable_entries {
+                match sstable_entry {
+                    Ok(SSTableEntry::Value { key, value }) => {
+                        merged.insert(key, Some(value));
+                    }
+                    Ok(SSTableEntry::Tombstone { key }) => {
+                        merged.insert(key, None);
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+
+            old_paths.push(old_path.clone());
+        }
+
+        self.sstables.clear();
+
+        if merged.values().any(|v| v.is_some()) {
+            let new_path = Self::sstable_path(&self.dir, self.next_sstable_id);
+
+            let mut sstable_writer = SSTableWriter::new(&new_path)?;
+
+            for (key, value_option) in merged {
+                if let Some(value) = value_option {
+                    sstable_writer.write_entry(&key, &value)?;
+                }
+            }
+
+            sstable_writer.finish()?;
+
+            let sstable = SSTable::open(&new_path)?;
+            self.sstables.push((new_path, sstable));
+
+            self.next_sstable_id += 1;
+        }
+
+        for old_path in old_paths {
+            remove_file(old_path)?;
+        }
+
+        Ok(())
+    }
+
     fn wal_path(dir: &Path) -> PathBuf {
         dir.join(Self::WAL_FILENAME)
     }
@@ -175,7 +242,9 @@ mod tests {
 
     fn tmp_dir() -> PathBuf {
         let id = TEST_ID.fetch_add(1, Ordering::SeqCst);
-        std::env::temp_dir().join(format!("notadb_lsm_test_{}", id))
+        let dir = std::env::temp_dir().join(format!("notadb_lsm_test_{}", id));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
     }
 
     #[test]
@@ -306,6 +375,93 @@ mod tests {
             })
             .count();
         assert_eq!(count, 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn sst_count(dir: &PathBuf) -> usize {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .filter(|e| {
+                e.as_ref()
+                    .unwrap()
+                    .file_name()
+                    .to_str()
+                    .unwrap()
+                    .ends_with(".sst")
+            })
+            .count()
+    }
+
+    #[test]
+    fn test_compact_merges_two_sstables() {
+        let dir = tmp_dir();
+        let mut engine = LsmEngine::open(&dir).unwrap();
+        engine.put(b"a", b"1").unwrap();
+        engine.flush().unwrap();
+        engine.put(b"b", b"2").unwrap();
+        engine.flush().unwrap();
+        engine.compact().unwrap();
+        assert_eq!(engine.get(b"a").unwrap(), Some(b"1".to_vec()));
+        assert_eq!(engine.get(b"b").unwrap(), Some(b"2".to_vec()));
+        assert_eq!(sst_count(&dir), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_compact_deduplicates_key_keeps_newest() {
+        let dir = tmp_dir();
+        let mut engine = LsmEngine::open(&dir).unwrap();
+        engine.put(b"key", b"old").unwrap();
+        engine.flush().unwrap();
+        engine.put(b"key", b"new").unwrap();
+        engine.flush().unwrap();
+        engine.compact().unwrap();
+        assert_eq!(engine.get(b"key").unwrap(), Some(b"new".to_vec()));
+        assert_eq!(sst_count(&dir), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_compact_drops_tombstones() {
+        let dir = tmp_dir();
+        let mut engine = LsmEngine::open(&dir).unwrap();
+        engine.put(b"key", b"value").unwrap();
+        engine.flush().unwrap();
+        engine.delete(b"key").unwrap();
+        engine.flush().unwrap();
+        engine.compact().unwrap();
+        assert_eq!(engine.get(b"key").unwrap(), None);
+        // all keys were tombstoned → no SSTable should remain
+        assert_eq!(sst_count(&dir), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_compact_result_survives_reopen() {
+        let dir = tmp_dir();
+        {
+            let mut engine = LsmEngine::open(&dir).unwrap();
+            engine.put(b"x", b"1").unwrap();
+            engine.flush().unwrap();
+            engine.put(b"y", b"2").unwrap();
+            engine.flush().unwrap();
+            engine.compact().unwrap();
+        }
+        let mut engine = LsmEngine::open(&dir).unwrap();
+        assert_eq!(engine.get(b"x").unwrap(), Some(b"1".to_vec()));
+        assert_eq!(engine.get(b"y").unwrap(), Some(b"2".to_vec()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_compact_with_fewer_than_two_sstables_is_noop() {
+        let dir = tmp_dir();
+        let mut engine = LsmEngine::open(&dir).unwrap();
+        engine.put(b"key", b"value").unwrap();
+        engine.flush().unwrap();
+        engine.compact().unwrap();
+        assert_eq!(engine.get(b"key").unwrap(), Some(b"value".to_vec()));
+        assert_eq!(sst_count(&dir), 1);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
